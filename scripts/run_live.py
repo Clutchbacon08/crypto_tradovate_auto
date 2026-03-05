@@ -15,6 +15,7 @@ from src.risk.guardian import ApexEODState, evaluate_risk
 from src.monitoring.health import heartbeat
 
 from src.risk.safety_guard import SafetyGuard, SafetyState
+from src.risk.reconcile import PositionReconciler
 
 
 def _require_live_gate():
@@ -37,9 +38,13 @@ def main():
     quote_stale = int(os.getenv("QUOTE_STALE_SECONDS", "5"))
     bal_poll = int(os.getenv("BALANCE_POLL_SECONDS", "10"))
 
-    # NEW: safety guard state
+    # Safety guard state
     safety = SafetyGuard()
     safety_state = SafetyState()
+
+    # NEW: Position reconciler (prevents desync/double-positioning)
+    # Use TRADOVATE_SYMBOL because that's what you actually send to broker.
+    reconciler = PositionReconciler(symbol=settings.TRADOVATE_SYMBOL, poll_seconds=5, max_errors=5)
 
     # state initialized; we will update current_balance via cash balance snapshot
     state = ApexEODState(
@@ -73,16 +78,16 @@ def main():
                     state.current_balance = float(bal)
 
                 last_bal_poll = now
-                safety_state.last_balance_ts = now  # NEW
+                safety_state.last_balance_ts = now
             except Exception as e:
                 print("[balance] poll failed:", e)
 
         # 2) get latest quote
         q = qs.get_last()
         if q is not None:
-            safety_state.last_quote_ts = q.ts  # NEW
+            safety_state.last_quote_ts = q.ts
 
-        # NEW: kill-switch safety check (quote + balance + ML presence)
+        # 3) kill-switch safety check (quote + balance + ML presence)
         safe, reason = safety.check_all(safety_state)
         if not safe:
             print(f"[SAFETY BLOCK] {reason}")
@@ -90,13 +95,13 @@ def main():
             time.sleep(1)
             continue
 
-        # existing quote freshness check (still useful)
+        # 4) quote freshness check
         if q is None or (now - q.ts) > quote_stale:
             heartbeat("live_waiting_quote")
             time.sleep(1)
             continue
 
-        # 3) Build minimal Features object (your compute_features pipeline can replace this later)
+        # 5) Build minimal Features object (replace later with full feature_engineering)
         feats = type("F", (), {})()
         feats.ts_utc = None
         feats.last_price = q.last
@@ -111,22 +116,38 @@ def main():
         feats.ema_50 = q.last
         feats.ema_200 = q.last
 
+        # 6) Reconcile local vs broker positions BEFORE proposing/placing trades
+        rr = reconciler.reconcile(local_open_contracts=state.open_contracts)
+        if rr.action == "HALT":
+            print("[RECONCILE HALT]", rr.reason)
+            heartbeat("live_reconcile_halt")
+            time.sleep(2)
+            continue
+
+        if rr.action == "RESYNC" and rr.snapshot is not None:
+            state.open_contracts = int(rr.snapshot.qty)
+            print("[RECONCILE RESYNC]", rr.reason)
+            heartbeat("live_reconcile_resync")
+            # If broker has a position or we just resynced, do not open a new one immediately
+            time.sleep(1)
+            continue
+
+        # 7) Strategy proposes trade intent
         intent = propose_trade(feats)
         if intent:
+            # 8) ML veto filter
             mld = ml_filter(intent, feats)
-
-            # NEW: if ML is missing / veto, we treat as safety disable for trading
             if not mld.approved:
                 if mld.reason == "ml_model_missing":
-                safety_state.ml_model_loaded = False
+                    safety_state.ml_model_loaded = False
                 print(f"[ml] veto prob={mld.prob:.2f} reason={mld.reason}")
                 heartbeat("live_ml_veto")
                 time.sleep(1)
                 continue
             else:
-                # if approved, ML is considered present/healthy
                 safety_state.ml_model_loaded = True
 
+            # 9) Apex risk guard
             rd = evaluate_risk(intent, state)
             if rd.action == "BLOCK":
                 print("[risk] block:", rd.reason)
@@ -138,8 +159,17 @@ def main():
                     qty_contracts=rd.qty_contracts,
                     client_order_id=str(uuid.uuid4()),
                 )
+
                 fill = execu.submit_market(cmd)
                 print(f"[LIVE] {cmd.side} {cmd.qty_contracts} {cmd.symbol} -> {fill.status}")
+
+                # Best-effort local position update (reconciler is source of truth)
+                try:
+                    side = getattr(cmd.side, "value", str(cmd.side)).upper()
+                    signed_qty = int(cmd.qty_contracts) * (1 if "BUY" in side else -1)
+                    state.open_contracts = signed_qty
+                except Exception:
+                    pass
 
         heartbeat("live_loop")
         time.sleep(1)
