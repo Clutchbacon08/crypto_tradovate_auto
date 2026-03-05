@@ -117,9 +117,8 @@ def main():
 
             # NEW: if ML is missing / veto, we treat as safety disable for trading
             if not mld.approved:
-                # mark ML not loaded if that’s the reason
-                if "missing" in (mld.reason or ""):
-                    safety_state.ml_model_loaded = False
+                if mld.reason == "ml_model_missing":
+                safety_state.ml_model_loaded = False
                 print(f"[ml] veto prob={mld.prob:.2f} reason={mld.reason}")
                 heartbeat("live_ml_veto")
                 time.sleep(1)
