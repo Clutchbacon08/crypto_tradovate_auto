@@ -1,6 +1,16 @@
 import os
 from pathlib import Path
 
+# ============================
+# Apex EOD Eval (50k) defaults
+# ============================
+APEX_ACCOUNT_SIZE = 50000.0
+APEX_PROFIT_TARGET_USD = 3000.0
+APEX_EOD_MAX_DRAWDOWN_USD = 2000.0
+APEX_DAILY_LOSS_LIMIT_USD = 1000.0
+APEX_MAX_CONTRACTS = 6
+APEX_CONTRACTS_PER_TRADE = 1  # fixed size during evaluation (can be <= max contracts)
+
 FILES = {
     # Root files
     ".gitignore": """\
@@ -19,26 +29,32 @@ mlruns/
 .DS_Store
 Thumbs.db
 """,
-    ".env.example": """\
-# Tradovate credentials (DO NOT COMMIT .env)
+    ".env.example": f"""\
+# ===== Tradovate credentials (DO NOT COMMIT .env) =====
 TRADOVATE_USERNAME=
 TRADOVATE_PASSWORD=
 TRADOVATE_APP_ID=
 TRADOVATE_APP_VERSION=1.0
-TRADOVATE_ENV=demo
+TRADOVATE_ENV=demo   # demo | live
 
-# Bot runtime
+# ===== Bot runtime =====
 MODE=paper           # paper | demo | live
 BOT_SYMBOL=MBT
 TIMEFRAME_MINUTES=15
 
-# Risk defaults (safe)
-MAX_OPEN_POSITIONS=1
-MAX_TRADES_PER_DAY=5
-DAILY_LOSS_LIMIT_PCT=-2.0
-MAX_DRAWDOWN_LIMIT_PCT=-8.0
+# ===== Apex EOD Eval (50k) =====
+ACCOUNT_SIZE={int(APEX_ACCOUNT_SIZE)}
+PROFIT_TARGET_USD={int(APEX_PROFIT_TARGET_USD)}
+EOD_MAX_DRAWDOWN_USD={int(APEX_EOD_MAX_DRAWDOWN_USD)}
+DAILY_LOSS_LIMIT_USD={int(APEX_DAILY_LOSS_LIMIT_USD)}
 
-# ML filter
+MAX_CONTRACTS={APEX_MAX_CONTRACTS}
+CONTRACTS_PER_TRADE={APEX_CONTRACTS_PER_TRADE}
+
+# Optional: stop trading once profit target is reached
+STOP_TRADING_ON_TARGET=true
+
+# ===== ML filter =====
 ML_ENABLED=true
 ML_MIN_PROB=0.55
 """,
@@ -154,27 +170,38 @@ class FillEvent(BaseModel):
     "src/common/settings.py": """\
 from __future__ import annotations
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 from src.common.schemas import Mode
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
+    # Broker (wired later)
     TRADOVATE_USERNAME: str = ""
     TRADOVATE_PASSWORD: str = ""
     TRADOVATE_APP_ID: str = ""
     TRADOVATE_APP_VERSION: str = "1.0"
     TRADOVATE_ENV: str = "demo"
 
+    # Bot
     MODE: Mode = Mode.PAPER
     BOT_SYMBOL: str = "MBT"
     TIMEFRAME_MINUTES: int = 15
 
-    MAX_OPEN_POSITIONS: int = 1
-    MAX_TRADES_PER_DAY: int = 5
-    DAILY_LOSS_LIMIT_PCT: float = -2.0
-    MAX_DRAWDOWN_LIMIT_PCT: float = -8.0
+    # ===== Apex EOD Eval rules (USD) =====
+    ACCOUNT_SIZE: float = 50000.0
 
+    PROFIT_TARGET_USD: float = 3000.0
+    EOD_MAX_DRAWDOWN_USD: float = 2000.0
+    DAILY_LOSS_LIMIT_USD: float = 1000.0
+
+    MAX_CONTRACTS: int = 6
+    CONTRACTS_PER_TRADE: int = 1
+
+    STOP_TRADING_ON_TARGET: bool = True
+
+    # ML
     ML_ENABLED: bool = True
     ML_MIN_PROB: float = 0.55
 
@@ -299,42 +326,105 @@ def main():
 if __name__ == "__main__":
     main()
 """,
-    # Risk
+    # Risk (Apex EOD Evaluation enforcement)
     "src/risk/guardian.py": """\
 from __future__ import annotations
+
 from dataclasses import dataclass
+from datetime import date
 from src.common.schemas import TradeIntent, RiskDecision
 from src.common.settings import settings
 
 
 @dataclass
-class RiskState:
-    open_positions: int = 0
+class ApexEODState:
+    # Session identification
+    session_date: date | None = None
+
+    # Balances (USD)
+    starting_balance: float = settings.ACCOUNT_SIZE
+    session_start_balance: float = settings.ACCOUNT_SIZE
+    current_balance: float = settings.ACCOUNT_SIZE
+
+    # Active thresholds during the trading session (USD)
+    eod_threshold_active: float = settings.ACCOUNT_SIZE - settings.EOD_MAX_DRAWDOWN_USD
+    dll_floor_active: float = settings.ACCOUNT_SIZE - settings.DAILY_LOSS_LIMIT_USD
+
+    # Tracking
     trades_today: int = 0
-    daily_pnl_pct: float = 0.0
-    drawdown_pct: float = 0.0
+    open_contracts: int = 0
     trading_disabled: bool = False
+    disable_reason: str = ""
+
+    # Profit target
+    profit_target_balance: float = settings.ACCOUNT_SIZE + settings.PROFIT_TARGET_USD
+
+    def start_new_session(self, today: date, current_balance: float) -> None:
+        self.session_date = today
+        self.session_start_balance = float(current_balance)
+        self.current_balance = float(current_balance)
+
+        # DLL is fixed during the session (based on session start balance)
+        self.dll_floor_active = self.session_start_balance - settings.DAILY_LOSS_LIMIT_USD
+
+        self.trades_today = 0
+        self.trading_disabled = False
+        self.disable_reason = ""
+
+    def on_balance_update(self, current_balance: float) -> None:
+        self.current_balance = float(current_balance)
+
+    def on_eod_close(self, eod_balance: float) -> None:
+        # EOD threshold is recalculated once per day at market close and enforced next session
+        eod_balance = float(eod_balance)
+        self.eod_threshold_active = eod_balance - settings.EOD_MAX_DRAWDOWN_USD
 
 
-def evaluate_risk(intent: TradeIntent, state: RiskState) -> RiskDecision:
+def _kill(reason: str) -> RiskDecision:
+    return RiskDecision(action="KILL", reason=reason, qty_contracts=0)
+
+
+def _block(reason: str) -> RiskDecision:
+    return RiskDecision(action="BLOCK", reason=reason, qty_contracts=0)
+
+
+def evaluate_risk(intent: TradeIntent, state: ApexEODState) -> RiskDecision:
     if state.trading_disabled:
-        return RiskDecision(action="BLOCK", reason="trading_disabled", qty_contracts=0)
+        return _block(f"trading_disabled:{state.disable_reason}")
 
-    if state.drawdown_pct <= settings.MAX_DRAWDOWN_LIMIT_PCT:
+    # Optional: stop trading when profit target reached
+    if settings.STOP_TRADING_ON_TARGET and state.current_balance >= state.profit_target_balance:
         state.trading_disabled = True
-        return RiskDecision(action="KILL", reason="max_drawdown_kill_switch", qty_contracts=0)
+        state.disable_reason = "profit_target_reached"
+        return _block("profit_target_reached_stop_trading")
 
-    if state.daily_pnl_pct <= settings.DAILY_LOSS_LIMIT_PCT:
+    # Rule 1: never touch/breach EOD threshold during session
+    if state.current_balance <= state.eod_threshold_active:
         state.trading_disabled = True
-        return RiskDecision(action="KILL", reason="daily_loss_kill_switch", qty_contracts=0)
+        state.disable_reason = "eod_threshold_breached"
+        return _kill("EOD_THRESHOLD_BREACHED_FAIL_EVAL")
 
-    if state.open_positions >= settings.MAX_OPEN_POSITIONS:
-        return RiskDecision(action="BLOCK", reason="max_open_positions", qty_contracts=0)
+    # Rule 2: DLL fixed during session; do not breach
+    if state.current_balance <= state.dll_floor_active:
+        state.trading_disabled = True
+        state.disable_reason = "daily_loss_limit_breached"
+        return _kill("DAILY_LOSS_LIMIT_BREACHED_FAIL_EVAL")
 
-    if state.trades_today >= settings.MAX_TRADES_PER_DAY:
-        return RiskDecision(action="BLOCK", reason="max_trades_per_day", qty_contracts=0)
+    # Rule 3: fixed position size during evaluation + max contracts
+    if settings.CONTRACTS_PER_TRADE <= 0:
+        return _block("contracts_per_trade_invalid")
 
-    return RiskDecision(action="ALLOW", reason="ok", qty_contracts=1)
+    if settings.CONTRACTS_PER_TRADE > settings.MAX_CONTRACTS:
+        return _block("contracts_per_trade_exceeds_max_contracts")
+
+    if state.open_contracts + settings.CONTRACTS_PER_TRADE > settings.MAX_CONTRACTS:
+        return _block("max_contracts_exposure_limit")
+
+    # Safety: optional trade count cap (not Apex rule)
+    if state.trades_today >= 20:
+        return _block("safety_trade_count_cap")
+
+    return RiskDecision(action="ALLOW", reason="apex_eod_ok", qty_contracts=settings.CONTRACTS_PER_TRADE)
 """,
     # Execution
     "src/execution/executor.py": """\
@@ -382,7 +472,7 @@ from src.common.schemas import OrderCommand
 from src.data.feature_engineering import compute_features
 from src.strategy.baseline_rules import propose_trade
 from src.ml.infer import ml_filter
-from src.risk.guardian import RiskState, evaluate_risk
+from src.risk.guardian import ApexEODState, evaluate_risk
 from src.execution.executor import execute_order_paper
 from src.monitoring.health import heartbeat
 
@@ -408,7 +498,15 @@ def main():
     print("=== PAPER MODE ===")
     print(f"Symbol={settings.BOT_SYMBOL} TF={settings.TIMEFRAME_MINUTES}m")
 
-    state = RiskState(open_positions=0, trades_today=0, daily_pnl_pct=0.0, drawdown_pct=0.0)
+    # Paper balance starts at account size
+    state = ApexEODState(
+        starting_balance=settings.ACCOUNT_SIZE,
+        session_start_balance=settings.ACCOUNT_SIZE,
+        current_balance=settings.ACCOUNT_SIZE,
+        eod_threshold_active=settings.ACCOUNT_SIZE - settings.EOD_MAX_DRAWDOWN_USD,
+        dll_floor_active=settings.ACCOUNT_SIZE - settings.DAILY_LOSS_LIMIT_USD,
+        open_contracts=0,
+    )
 
     while True:
         df = fake_market_df(300)
@@ -446,7 +544,7 @@ def main():
 
                     fill = execute_order_paper(cmd)
                     state.trades_today += 1
-                    state.open_positions = 1  # placeholder
+                    state.open_contracts += rd.qty_contracts
                     print(f"[{feats.ts_utc}] PAPER {cmd.side} {cmd.qty_contracts} {cmd.symbol} SL={sl:.2f} TP={tp:.2f} -> {fill.status}")
 
         heartbeat("paper_loop")
@@ -490,7 +588,7 @@ def main() -> None:
     for path, content in FILES.items():
         write_file(path, content)
 
-    print("✅ Repo scaffold generated.")
+    print("✅ Repo scaffold generated WITH Apex EOD (50k) rules.")
     print("Next (on VPS):")
     print("  1) python -m venv .venv && .venv\\Scripts\\activate")
     print("  2) pip install -r requirements.txt")
