@@ -186,6 +186,11 @@ def simulate_fold(
     tp_price = 0.0
     cooldown_left = 0
 
+    # keep these so we can log them at entry and use them in the exit row
+    stop_dist = 0.0
+    tp_dist = 0.0
+    entry_feature_row: Dict[str, Any] = {}
+
     equity = ACCOUNT_SIZE
     peak_equity = equity
     max_dd = 0.0
@@ -297,13 +302,23 @@ def simulate_fold(
                 # label for ML (win=1 if TP, else 0)
                 if save_trades and len(trades_rows) < MAX_TRADES_SAVED_PER_TRIAL:
                     label_win = 1 if exit_reason == "TP" else 0
+
+                    # Risk in USD (1R) based on stop distance + round-trip fees
+                    risk_usd = (abs(entry_feature_row.get("stop_dist", 0.0)) * CONTRACT_MULTIPLIER * CONTRACTS_PER_TRADE) + (
+                        fee_roundtrip_usd() * CONTRACTS_PER_TRADE
+                    )
+                    r_multiple = pnl_usd / max(risk_usd, 1e-9)
+
                     row = {
-                        # features at entry time (stored when we entered)
+                        # features at entry time
                         **entry_feature_row,
                         # outcome
-                        "label_win": label_win,
-                        "pnl_usd": pnl_usd,
-                        "exit_reason": exit_reason,
+                        "label_win": int(label_win),
+                        "pnl_usd": float(pnl_usd),
+                        "risk_usd": float(risk_usd),
+                        "r_multiple": float(r_multiple),
+                        "exit_reason": str(exit_reason),
+                        "exit_price": float(exit_price),
                     }
                     trades_rows.append(row)
 
@@ -336,8 +351,8 @@ def simulate_fold(
                 entry_price = close[i] + slip if position == 1 else close[i] - slip
 
                 dist = max(a[i], 1e-9)
-                stop_dist = stop_atr * dist
-                tp_dist = tp_atr * dist
+                stop_dist = float(stop_atr * dist)
+                tp_dist = float(tp_atr * dist)
 
                 if position == 1:
                     stop_price = entry_price - stop_dist
@@ -346,11 +361,13 @@ def simulate_fold(
                     stop_price = entry_price + stop_dist
                     tp_price = entry_price - tp_dist
 
-                # store entry-time features for ML dataset
+                # store entry-time features for ML dataset + trade geometry for meta-labeling
                 entry_feature_row = {
                     **params_for_logging,
                     "ts_utc": str(df.iloc[i]["ts_utc"]),
                     "side": "BUY" if position == 1 else "SELL",
+
+                    # --- ML features at entry ---
                     "ret_1": float(ret_1[i]),
                     "ret_5": float(ret_5[i]),
                     "atr_14": float(a[i]),
@@ -358,6 +375,18 @@ def simulate_fold(
                     "ema200_dist": float(ema200_dist),
                     "vol_zscore": float(vol_z[i]),
                     "trend_strength": float(trend_strength[i]),
+
+                    # --- trade geometry for meta-labeling ---
+                    "entry_price": float(entry_price),
+                    "stop_price": float(stop_price),
+                    "tp_price": float(tp_price),
+                    "stop_dist": float(stop_dist),
+                    "tp_dist": float(tp_dist),
+
+                    # keep these aligned with infer.py
+                    "stop_atr": float(stop_atr),
+                    "tp_atr": float(tp_atr),
+                    "cooldown": int(cooldown),
                 }
 
     update_drawdown()
@@ -402,8 +431,6 @@ def robust_score_from_folds(folds: List[FoldStats]) -> TrialSummary:
         return TrialSummary(-1e9, mean_pnl, std_pnl, worst_pnl, mean_pf, mean_dd, trades_mean, dll_b, eod_b)
 
     # Stability scoring (pro-style):
-    # reward mean pnl and profit factor, penalize variability and drawdown and bad worst fold
-    # You can tune weights later.
     dd_penalty = max(0.0, mean_dd - 0.75 * EOD_MAX_DRAWDOWN_USD) * 1.0
     var_penalty = std_pnl * 0.7
     worst_penalty = max(0.0, -worst_pnl) * 1.2
