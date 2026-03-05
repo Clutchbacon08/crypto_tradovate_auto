@@ -29,16 +29,16 @@ def ml_filter(intent: TradeIntent, features: Features) -> MLDecision:
     model = pack.get("model")
     cols = pack.get("feature_cols", [])
 
-    # No model yet -> allow (for early testing). Flip to block if you prefer.
+    # If model isn't trained yet, allow trades so you can test the system end-to-end.
+    # If you want ultra safety, change approved=True -> False.
     if model is None or not cols:
         return MLDecision(approved=True, prob=0.5, reason="model_missing_allow")
 
-    # Feature row must match train_signal_model.py feature_cols.
     row = {
         "ret_1": features.ret_1,
         "ret_5": features.ret_5,
         "atr_14": features.atr_14,
-        "ema_fast_minus_slow": features.ema_20 - features.ema_50,  # proxy until live computes chosen params
+        "ema_fast_minus_slow": features.ema_20 - features.ema_50,
         "ema200_dist": features.last_price - features.ema_200,
         "vol_zscore": 0.0,
         "trend_strength": 0.0,
