@@ -168,9 +168,16 @@ def main():
                     qty_contracts=rd.qty_contracts,
                     client_order_id=str(uuid.uuid4()),
                 )
-
+                if trades_today >= max_trades_per_day:
+                    print(f"[LIMIT] MAX_TRADES_PER_DAY reached ({trades_today}/{max_trades_per_day}). Blocking entries.")
+                    heartbeat("trade_limit_hit")
+                    time.sleep(2)
+                    continue
                 fill = execu.submit_market(cmd)
                 print(f"[LIVE] {cmd.side} {cmd.qty_contracts} {cmd.symbol} -> {fill.status}")
+                fill = execu.submit_market(cmd)
+                trades_today += 1
+
 
                 # Best-effort local position update (reconciler is source of truth)
                 try:
