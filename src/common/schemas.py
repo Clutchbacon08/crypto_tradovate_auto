@@ -1,7 +1,9 @@
 from pathlib import Path
 
-schemas_path = Path("/content/crypto_tradovate_auto/src/common/schemas.py")
-schemas_path.write_text(
+p = Path("/content/crypto_tradovate_auto/src/common/schemas.py")
+p.parent.mkdir(parents=True, exist_ok=True)
+
+p.write_text(
 """from __future__ import annotations
 
 from dataclasses import dataclass
@@ -75,5 +77,5 @@ class OrderCommand:
     encoding="utf-8"
 )
 
-print("Overwrote:", schemas_path)
-print("Contains 'class Mode':", "class Mode" in schemas_path.read_text(encoding="utf-8"))
+print("WROTE:", p)
+print("size:", p.stat().st_size)
