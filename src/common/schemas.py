@@ -12,9 +12,15 @@ from typing import Optional
 
 
 class Mode(str, Enum):
+    # lowercase (what we use in .env)
     paper = "paper"
     demo = "demo"
     live = "live"
+
+    # uppercase aliases (what settings.py expects)
+    PAPER = "paper"
+    DEMO = "demo"
+    LIVE = "live"
 
 
 class Side(str, Enum):
