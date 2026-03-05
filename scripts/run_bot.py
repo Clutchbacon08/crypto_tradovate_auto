@@ -346,3 +346,35 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    # --- Write summary (always) ---
+    import json
+    import numpy as np
+
+    summary_out = Path("artifacts/paper_summary.json")
+    tdf = pd.DataFrame(paper_rows)
+
+    if len(tdf) == 0:
+        summary = {"trades": 0, "message": "No completed trades."}
+    else:
+        pnl = tdf["pnl_usd"].astype(float)
+        wins = int((pnl > 0).sum())
+        losses = int((pnl <= 0).sum())
+        gross_win = float(pnl[pnl > 0].sum())
+        gross_loss = float((-pnl[pnl < 0]).sum())
+        pf = float(gross_win / gross_loss) if gross_loss > 0 else (float("inf") if gross_win > 0 else 0.0)
+
+        summary = {
+            "trades": int(len(tdf)),
+            "win_rate": float(wins / len(tdf)),
+            "profit_factor": float(pf),
+            "total_pnl_usd": float(pnl.sum()),
+            "avg_pnl_usd": float(pnl.mean()),
+            "median_pnl_usd": float(pnl.median()),
+            "final_balance": float(tdf["balance"].iloc[-1]),
+            "max_balance": float(tdf["balance"].max()),
+            "min_balance": float(tdf["balance"].min()),
+        }
+
+    summary_out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print("Saved:", summary_out)
