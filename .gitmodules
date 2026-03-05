@@ -1,0 +1,15 @@
+[submodule "vendor/Tradovate-Python-Client"]
+	path = vendor/Tradovate-Python-Client
+	url = https://github.com/cullen-b/Tradovate-Python-Client
+
+[submodule "vendor/mlflow"]
+	path = vendor/mlflow
+	url = https://github.com/mlflow/mlflow
+
+[submodule "vendor/rq"]
+	path = vendor/rq
+	url = https://github.com/rq/rq
+
+[submodule "vendor/rq-scheduler"]
+	path = vendor/rq-scheduler
+	url = https://github.com/rq/rq-scheduler
