@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 import uuid
+from datetime import datetime
 
 from src.common.settings import settings
 from src.adapters.tradovate.rest_client import TradovateREST
@@ -54,12 +55,20 @@ def main():
         eod_threshold_active=settings.ACCOUNT_SIZE - settings.EOD_MAX_DRAWDOWN_USD,
         dll_floor_active=settings.ACCOUNT_SIZE - settings.DAILY_LOSS_LIMIT_USD,
         open_contracts=0,
+        max_trades_per_day = int(os.getenv("MAX_TRADES_PER_DAY", "20"))
+        trade_day = datetime.now().date()
+    trades_today = 0
     )
 
     last_bal_poll = 0.0
 
     while True:
         now = time.time()
+        today = datetime.now().date()
+        if today != trade_day:
+        trade_day = today
+        trades_today = 0
+# -----------------------------
 
         # 1) poll balance/PnL snapshot
         if now - last_bal_poll >= bal_poll:
