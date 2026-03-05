@@ -43,11 +43,10 @@ def main():
     safety = SafetyGuard()
     safety_state = SafetyState()
 
-    # NEW: Position reconciler (prevents desync/double-positioning)
-    # Use TRADOVATE_SYMBOL because that's what you actually send to broker.
+    # Position reconciler (prevents desync/double-positioning)
     reconciler = PositionReconciler(symbol=settings.TRADOVATE_SYMBOL, poll_seconds=5, max_errors=5)
 
-    # state initialized; we will update current_balance via cash balance snapshot
+    # Apex state (balance is updated via cash balance snapshot)
     state = ApexEODState(
         starting_balance=settings.ACCOUNT_SIZE,
         session_start_balance=settings.ACCOUNT_SIZE,
@@ -55,34 +54,40 @@ def main():
         eod_threshold_active=settings.ACCOUNT_SIZE - settings.EOD_MAX_DRAWDOWN_USD,
         dll_floor_active=settings.ACCOUNT_SIZE - settings.DAILY_LOSS_LIMIT_USD,
         open_contracts=0,
-        max_trades_per_day = int(os.getenv("MAX_TRADES_PER_DAY", "20"))
-        trade_day = datetime.now().date()
-    trades_today = 0
     )
+
+    # -----------------------------
+    # MAX TRADES PER DAY LIMITER
+    # -----------------------------
+    max_trades_per_day = int(os.getenv("MAX_TRADES_PER_DAY", "20"))
+    trade_day = datetime.now().date()
+    trades_today = 0
+    # -----------------------------
 
     last_bal_poll = 0.0
 
     while True:
         now = time.time()
+
+        # -----------------------------
+        # RESET TRADE COUNT EACH DAY
+        # -----------------------------
         today = datetime.now().date()
         if today != trade_day:
-        trade_day = today
-        trades_today = 0
-# -----------------------------
+            trade_day = today
+            trades_today = 0
+        # -----------------------------
 
         # 1) poll balance/PnL snapshot
         if now - last_bal_poll >= bal_poll:
             try:
                 snap = tv_rest.cash_balance_snapshot(account_id)
-
-                # best-effort fields; vary by account
                 bal = (
                     snap.get("cashBalance")
                     or snap.get("balance")
                     or snap.get("netLiq")
                     or snap.get("equity")
                 )
-
                 if bal is not None:
                     state.current_balance = float(bal)
 
@@ -110,7 +115,7 @@ def main():
             time.sleep(1)
             continue
 
-        # 5) Build minimal Features object (replace later with full feature_engineering)
+        # 5) Build minimal Features object
         feats = type("F", (), {})()
         feats.ts_utc = None
         feats.last_price = q.last
@@ -137,7 +142,6 @@ def main():
             state.open_contracts = int(rr.snapshot.qty)
             print("[RECONCILE RESYNC]", rr.reason)
             heartbeat("live_reconcile_resync")
-            # If broker has a position or we just resynced, do not open a new one immediately
             time.sleep(1)
             continue
 
@@ -164,20 +168,26 @@ def main():
                 print("[risk] KILL:", rd.reason)
                 break
             else:
-                cmd = intent.to_order_command(
-                    qty_contracts=rd.qty_contracts,
-                    client_order_id=str(uuid.uuid4()),
-                )
+                # -----------------------------
+                # TRADE LIMIT CHECK (before submit)
+                # -----------------------------
                 if trades_today >= max_trades_per_day:
                     print(f"[LIMIT] MAX_TRADES_PER_DAY reached ({trades_today}/{max_trades_per_day}). Blocking entries.")
                     heartbeat("trade_limit_hit")
                     time.sleep(2)
                     continue
+                # -----------------------------
+
+                cmd = intent.to_order_command(
+                    qty_contracts=rd.qty_contracts,
+                    client_order_id=str(uuid.uuid4()),
+                )
+
                 fill = execu.submit_market(cmd)
                 print(f"[LIVE] {cmd.side} {cmd.qty_contracts} {cmd.symbol} -> {fill.status}")
-                fill = execu.submit_market(cmd)
-                trades_today += 1
 
+                # increment daily counter once per order submission
+                trades_today += 1
 
                 # Best-effort local position update (reconciler is source of truth)
                 try:
