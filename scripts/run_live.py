@@ -14,6 +14,8 @@ from src.ml.infer import ml_filter
 from src.risk.guardian import ApexEODState, evaluate_risk
 from src.monitoring.health import heartbeat
 
+from src.risk.safety_guard import SafetyGuard, SafetyState
+
 
 def _require_live_gate():
     if os.getenv("I_UNDERSTAND_LIVE_TRADING", "false").lower() != "true":
@@ -35,6 +37,10 @@ def main():
     quote_stale = int(os.getenv("QUOTE_STALE_SECONDS", "5"))
     bal_poll = int(os.getenv("BALANCE_POLL_SECONDS", "10"))
 
+    # NEW: safety guard state
+    safety = SafetyGuard()
+    safety_state = SafetyState()
+
     # state initialized; we will update current_balance via cash balance snapshot
     state = ApexEODState(
         starting_balance=settings.ACCOUNT_SIZE,
@@ -54,24 +60,43 @@ def main():
         if now - last_bal_poll >= bal_poll:
             try:
                 snap = tv_rest.cash_balance_snapshot(account_id)
+
                 # best-effort fields; vary by account
-                bal = snap.get("cashBalance") or snap.get("balance") or snap.get("netLiq") or snap.get("equity")
+                bal = (
+                    snap.get("cashBalance")
+                    or snap.get("balance")
+                    or snap.get("netLiq")
+                    or snap.get("equity")
+                )
+
                 if bal is not None:
                     state.current_balance = float(bal)
+
                 last_bal_poll = now
+                safety_state.last_balance_ts = now  # NEW
             except Exception as e:
                 print("[balance] poll failed:", e)
 
         # 2) get latest quote
         q = qs.get_last()
+        if q is not None:
+            safety_state.last_quote_ts = q.ts  # NEW
+
+        # NEW: kill-switch safety check (quote + balance + ML presence)
+        safe, reason = safety.check_all(safety_state)
+        if not safe:
+            print(f"[SAFETY BLOCK] {reason}")
+            heartbeat("live_safety_block")
+            time.sleep(1)
+            continue
+
+        # existing quote freshness check (still useful)
         if q is None or (now - q.ts) > quote_stale:
             heartbeat("live_waiting_quote")
             time.sleep(1)
             continue
 
         # 3) Build minimal Features object (your compute_features pipeline can replace this later)
-        # We keep it simple: strategy uses price only right now.
-        # If your propose_trade expects full Features, ensure it can accept price-only or update your feature engineering.
         feats = type("F", (), {})()
         feats.ts_utc = None
         feats.last_price = q.last
@@ -89,11 +114,19 @@ def main():
         intent = propose_trade(feats)
         if intent:
             mld = ml_filter(intent, feats)
+
+            # NEW: if ML is missing / veto, we treat as safety disable for trading
             if not mld.approved:
-                print(f"[ml] veto prob={mld.prob:.2f}")
+                # mark ML not loaded if that’s the reason
+                if "missing" in (mld.reason or ""):
+                    safety_state.ml_model_loaded = False
+                print(f"[ml] veto prob={mld.prob:.2f} reason={mld.reason}")
                 heartbeat("live_ml_veto")
                 time.sleep(1)
                 continue
+            else:
+                # if approved, ML is considered present/healthy
+                safety_state.ml_model_loaded = True
 
             rd = evaluate_risk(intent, state)
             if rd.action == "BLOCK":
