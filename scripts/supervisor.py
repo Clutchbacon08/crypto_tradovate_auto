@@ -27,8 +27,8 @@ def select_bot_script() -> str:
     mode = os.getenv("MODE", "live").lower().strip()
 
     if mode == "paper":
-        # If you don't have run_paper.py, change this to scripts/run_bot.py or your paper runner
-        return "scripts/run_paper.py"
+        # If you don't have run_bot.py, change this to scripts/run_bot.py or your paper runner
+        return "scripts/run_bot.py"
 
     if mode == "demo":
         return "scripts/run_demo.py"
