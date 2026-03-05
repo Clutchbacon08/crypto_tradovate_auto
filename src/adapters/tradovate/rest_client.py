@@ -133,3 +133,13 @@ class TradovateREST:
         # Optional convenience; endpoint differs by API versions, so this is a placeholder.
         # We keep it here so you can add later without changing bot structure.
         return
+    def cash_balance_snapshot(self, account_id: int) -> dict:
+        """
+        Uses cash balance snapshot for current balance / open pnl when available.
+        Tradovate community notes it's available but discouraged to call too frequently. :contentReference[oaicite:5]{index=5}
+        """
+        url = f"{self.base_url}/cashBalance/getcashbalancesnapshot"
+        payload = {"accountId": int(account_id)}
+        r = requests.post(url, headers=self._headers(), json=payload, timeout=30)
+        r.raise_for_status()
+        return r.json()
