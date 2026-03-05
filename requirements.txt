@@ -1,2 +1,11 @@
-optuna-dashboard
+pandas
+numpy
+scikit-learn
+optuna
 tqdm
+joblib
+requests
+python-dotenv
+pydantic
+pydantic-settings
+pyarrow
